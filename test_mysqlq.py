@@ -27,7 +27,6 @@ host = db.example.com
 port = 3307
 user = reader
 password = s3cr"et\\pw
-database = app
 """
 
 # Stands in for the mysql client: records its arguments, the defaults file it was handed, and stdin
@@ -216,7 +215,11 @@ class MainTest(unittest.TestCase):
         self.assertIn('password="s3cr\\"et\\\\pw"', rec["cnf"])
         self.assertIn("host=db.example.com\nport=3307", rec["cnf"])
         self.assertIn("--skip-reconnect", rec["argv"])
-        self.assertEqual(rec["argv"][-1], "app")
+        self.assertEqual(rec["argv"][-1], "--batch")  # no database unless -d is given
+
+    def test_database_flag(self):
+        self.run_mysqlq("--profile", "test", "-d", "app", "SELECT 1")
+        self.assertEqual(self.recorded()["argv"][-1], "app")
 
     def test_default_limits(self):
         self.run_mysqlq("--profile", "test", "SELECT 1")

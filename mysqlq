@@ -13,7 +13,6 @@ Profiles live in ~/.mysqlq/credentials (override with MYSQLQ_CREDENTIALS), INI f
   port = 3306
   user = readonly
   password = secret
-  database = fms_tasking        ; optional default database
   socks_proxy = 127.0.0.1:1081  ; optional SOCKS5 proxy (no auth)
 
 The credentials file must be owned by you and not readable by anyone else (chmod 600).
@@ -162,7 +161,7 @@ def main():
     parser = argparse.ArgumentParser(prog="mysqlq", description="Read-only MySQL queries by profile.")
     parser.add_argument("sql", nargs="?", help="SQL to run; read from stdin when omitted")
     parser.add_argument("--profile", "-p", default=os.environ.get("MYSQLQ_PROFILE"), help="profile name")
-    parser.add_argument("--database", "-d", help="database, overriding the profile's")
+    parser.add_argument("--database", "-d", help="default database for unqualified table names")
     parser.add_argument("--vertical", "-E", action="store_true", help="print one column per line")
     parser.add_argument("--table", "-t", action="store_true", help="print as a boxed table")
     parser.add_argument("--max-rows", type=int, default=1000, metavar="N",
@@ -204,9 +203,8 @@ def main():
             cmd.append("--vertical")
         if args.table:
             cmd.append("--table")
-        database = args.database or profile.get("database")
-        if database:
-            cmd.append(database)
+        if args.database:
+            cmd.append(args.database)
         return subprocess.run(cmd, input=sql, text=True, pass_fds=(read_fd,)).returncode
     finally:
         os.close(read_fd)

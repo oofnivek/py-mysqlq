@@ -8,6 +8,9 @@ mysqlq --profile uat -d fms_tasking -E "SELECT ..."
 echo "SHOW TABLES" | mysqlq --profile uat
 ```
 
+A profile identifies a server, not a database, so one profile reaches every database the user can read. Pick one per
+run with `-d`, or qualify table names (`SELECT * FROM fms_tasking.v1_jobs`).
+
 Only `SELECT`, `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN` and `WITH` statements are accepted, and the session is set
 read-only on the server. Requires Python 3.8+, a MySQL 5.7.8+ server, and a recent MySQL `mysql` client on `PATH`.
 The MariaDB client (what Debian/Ubuntu install as `mysql`) is not supported: it has no `--commands` option.
@@ -48,7 +51,6 @@ Each `[section]` is a profile:
 | `user`        | yes      | MySQL user (ideally one with read-only grants)    |
 | `password`    | yes      | MySQL password                                    |
 | `port`        | no       | Defaults to `3306`                                |
-| `database`    | no       | Default database; `-d` overrides it               |
 | `socks_proxy` | no       | `host:port` of a SOCKS5 proxy (no authentication) |
 
 Inline comments must start with `;`.
