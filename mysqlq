@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""mysqlq - read-only MySQL queries by named profile, optionally through a SOCKS5 proxy.
+
+Usage:
+  mysqlq --profile uat "SELECT * FROM v1_jobs WHERE id = 1"
+  mysqlq --profile uat -d fms_tasking -E "SELECT ..."
+  echo "SHOW TABLES" | mysqlq --profile uat
+
+Profiles live in ~/.mysqlq/credentials (override with MYSQLQ_CREDENTIALS), INI format:
+
+  [uat]
+  host = example.rds.amazonaws.com
+  port = 3306
+  user = readonly
+  password = secret
+  database = fms_tasking        ; optional default database
+  socks_proxy = 127.0.0.1:1081  ; optional SOCKS5 proxy (no auth)
+
+The credentials file must be owned by you and not readable by anyone else (chmod 600).
+
+Requires the `mysql` client on PATH. Only SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statements are accepted, and the
+session runs read-only. Each SELECT returns at most --max-rows rows (default 1000) and is aborted after --timeout
+seconds (default 30); pass 0 to lift either limit.
+"""
+import argparse
+import configparser
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+
+DEFAULT_CREDENTIALS = os.path.expanduser("~/.mysqlq/credentials")
+UNLIMITED_ROWS = 18446744073709551615  # max value of sql_select_limit
+ALLOWED_STATEMENTS = {"select", "show", "describe", "desc", "explain", "with"}
+
+
+# --- read-only guard -------------------------------------------------------------------------------------------------
+
+def check_read_only(sql):
+    """Raise ValueError unless every statement is a read. Literals and comments are stripped first so a keyword
+    inside a string can't pass or fail the check."""
+    if re.search(r"/\*[!+]", sql):
+        # /*! ... */ and optimizer-hint comments are executed by MySQL, not ignored
+        raise ValueError("executable comments (/*! */, /*+ */) are not allowed")
+    stripped = re.sub(
+        r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.|\"\")*\"|`[^`]*`|/\*.*?\*/|(?:--\s|#)[^\n]*",
+        " ", sql, flags=re.S)
+    if "\\" in stripped:
+        raise ValueError("mysql client commands (\\x) are not allowed")
+    statements = [s.strip() for s in stripped.split(";") if s.strip()]
+    if not statements:
+        raise ValueError("no SQL given")
+    for stmt in statements:
+        keyword = stmt.split(None, 1)[0].lower().lstrip("(")
+        if keyword not in ALLOWED_STATEMENTS:
+            raise ValueError(f"only {', '.join(sorted(ALLOWED_STATEMENTS))} are allowed, got: {keyword.upper()}")
+        # WITH ... DELETE and EXPLAIN ANALYZE UPDATE pass the keyword check but execute the write
+        write = re.search(r"\b(insert|update|delete|replace|drop|alter|create|truncate|grant|revoke|rename|call|load"
+                          r"|handler|lock|unlock)\b", stmt, re.I)
+        if write:
+            raise ValueError(f"{write.group(1).upper()} is not allowed")
+        if re.search(r"\binto\s+(outfile|dumpfile)\b|\block\s+in\s+share\s+mode\b", stmt, re.I):
+            raise ValueError("SELECT ... INTO OUTFILE/DUMPFILE and locking reads are not allowed")
+
+
+# --- SOCKS5 forwarder ------------------------------------------------------------------------------------------------
+
+def socks5_connect(proxy, target_host, target_port):
+    sock = socket.create_connection(proxy, timeout=15)
+    sock.sendall(b"\x05\x01\x00")  # SOCKS5, one auth method: none
+    if recv_exact(sock, 2) != b"\x05\x00":
+        raise ConnectionError("SOCKS proxy refused no-auth handshake")
+    host = target_host.encode()
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", target_port))
+    reply = recv_exact(sock, 4)
+    if reply[1] != 0:
+        raise ConnectionError(f"SOCKS proxy failed to connect to {target_host}:{target_port} (code {reply[1]})")
+    addr_len = {1: 4, 4: 16}.get(reply[3]) or recv_exact(sock, 1)[0]
+    recv_exact(sock, addr_len + 2)  # bound address + port, unused
+    sock.settimeout(None)
+    return sock
+
+
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("SOCKS proxy closed the connection")
+        data += chunk
+    return data
+
+
+def pipe(src, dst):
+    try:
+        while data := src.recv(65536):
+            dst.sendall(data)
+    except OSError:
+        pass  # either side closing ends the pipe; the mysql client reports any real failure
+    finally:
+        src.close()
+        dst.close()
+
+
+def start_forwarder(proxy, target_host, target_port):
+    """Listen on an ephemeral localhost port and tunnel the first connection through the proxy. Returns the port.
+    The listener closes after that one accept, so other local users can't reuse the tunnel while the query runs."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+
+    def serve():
+        with server:
+            client, _ = server.accept()
+        try:
+            upstream = socks5_connect(proxy, target_host, target_port)
+        except OSError as ex:
+            print(f"mysqlq: {ex}", file=sys.stderr)
+            client.close()
+            return
+        threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+        threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return server.getsockname()[1]
+
+
+# --- main ------------------------------------------------------------------------------------------------------------
+
+def load_profile(name):
+    path = os.environ.get("MYSQLQ_CREDENTIALS", DEFAULT_CREDENTIALS)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        sys.exit(f"mysqlq: credentials file not found: {path}")
+    # Like ssh with private keys: refuse a file that someone else owns or can read
+    if st.st_uid != os.getuid():
+        sys.exit(f"mysqlq: {path} is not owned by you")
+    if st.st_mode & 0o077:
+        sys.exit(f"mysqlq: {path} is accessible by other users (mode {st.st_mode & 0o777:o}); "
+                 f"run: chmod 600 {path}")
+    config = configparser.ConfigParser(inline_comment_prefixes=(";",), interpolation=None)
+    config.read(path)
+    if name not in config:
+        sys.exit(f"mysqlq: profile '{name}' not found in {path}")
+    profile = config[name]
+    missing = [k for k in ("host", "user", "password") if not profile.get(k)]
+    if missing:
+        sys.exit(f"mysqlq: profile '{name}' is missing {', '.join(missing)}")
+    return profile
+
+
+def parse_host_port(value):
+    host, _, port = value.rpartition(":")
+    return host, int(port)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="mysqlq", description="Read-only MySQL queries by profile.")
+    parser.add_argument("sql", nargs="?", help="SQL to run; read from stdin when omitted")
+    parser.add_argument("--profile", "-p", default=os.environ.get("MYSQLQ_PROFILE"), help="profile name")
+    parser.add_argument("--database", "-d", help="database, overriding the profile's")
+    parser.add_argument("--vertical", "-E", action="store_true", help="print one column per line")
+    parser.add_argument("--table", "-t", action="store_true", help="print as a boxed table")
+    parser.add_argument("--max-rows", type=int, default=1000, metavar="N",
+                        help="return at most N rows per SELECT (default: %(default)s, 0 = no limit)")
+    parser.add_argument("--timeout", type=int, default=30, metavar="SECONDS",
+                        help="abort a SELECT running longer than this (default: %(default)s, 0 = no limit)")
+    args = parser.parse_args()
+
+    if not args.profile:
+        parser.error("--profile is required (or set MYSQLQ_PROFILE)")
+    if args.max_rows < 0 or args.timeout < 0:
+        parser.error("--max-rows and --timeout must be 0 or more")
+    if args.sql is None and sys.stdin.isatty():
+        parser.error("no SQL given: pass it as an argument or pipe it on stdin")
+    sql = args.sql if args.sql is not None else sys.stdin.read()
+    try:
+        check_read_only(sql)
+    except ValueError as ex:
+        sys.exit(f"mysqlq: rejected: {ex}")
+
+    profile = load_profile(args.profile)
+    host, port = profile["host"], profile.getint("port", 3306)
+    if profile.get("socks_proxy"):
+        port = start_forwarder(parse_host_port(profile["socks_proxy"]), host, port)
+        host = "127.0.0.1"
+
+    # Credentials go to mysql through a pipe, so they never touch the disk or the command line where `ps` shows them
+    password = profile["password"].replace("\\", "\\\\").replace('"', '\\"')
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(write_fd, "w") as cnf:
+        cnf.write(f'[client]\nuser="{profile["user"]}"\npassword="{password}"\nhost={host}\nport={port}\n')
+    # Enforced by the server, so a write is refused and a runaway SELECT is stopped even if the guard above misses
+    init = (f"SET SESSION transaction_read_only = ON, max_execution_time = {args.timeout * 1000}, "
+            f"sql_select_limit = {args.max_rows or UNLIMITED_ROWS}")
+    try:
+        cmd = ["mysql", f"--defaults-extra-file=/dev/fd/{read_fd}", "--protocol=TCP", "--commands=OFF",
+               "--skip-reconnect", f"--init-command={init}", "--batch"]
+        if args.vertical:
+            cmd.append("--vertical")
+        if args.table:
+            cmd.append("--table")
+        database = args.database or profile.get("database")
+        if database:
+            cmd.append(database)
+        return subprocess.run(cmd, input=sql, text=True, pass_fds=(read_fd,)).returncode
+    finally:
+        os.close(read_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
